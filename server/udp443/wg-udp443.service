@@ -1,0 +1,13 @@
+[Unit]
+Description=WireGuard UDP/443 compatibility alias
+After=network-online.target wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '/usr/sbin/iptables -t nat -C PREROUTING -i ens4 -p udp --dport 443 -j REDIRECT --to-ports 51820 2>/dev/null || /usr/sbin/iptables -t nat -I PREROUTING 1 -i ens4 -p udp --dport 443 -j REDIRECT --to-ports 51820'
+ExecStop=/bin/sh -c '/usr/sbin/iptables -t nat -D PREROUTING -i ens4 -p udp --dport 443 -j REDIRECT --to-ports 51820 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

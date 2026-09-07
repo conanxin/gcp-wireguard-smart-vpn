@@ -1,0 +1,9 @@
+port=53
+interface=wg0
+listen-address=10.66.66.1
+bind-interfaces
+no-resolv
+server=169.254.169.254
+cache-size=1000
+domain-needed
+bogus-priv

@@ -1,0 +1,8 @@
+[Unit]
+Description=Persist WireGuard peer traffic counters
+After=wg-quick@wg0.service
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/wg-traffic-collect

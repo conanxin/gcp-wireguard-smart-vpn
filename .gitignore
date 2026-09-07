@@ -1,0 +1,26 @@
+﻿# WireGuard private material
+*.key
+*.conf
+!*.conf.example
+*.pub
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.etl
+
+# Generated rule datasets
+data/*.txt
+data/*.yml
+data/*.yaml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+!data/cn-ipv4-cidrs.txt
+!data/cn-nrpt-namespaces.txt
+!data/cn-nrpt-unsupported-regexp.txt

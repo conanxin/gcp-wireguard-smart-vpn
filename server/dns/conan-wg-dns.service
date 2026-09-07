@@ -1,0 +1,13 @@
+[Unit]
+Description=Private DNS for WireGuard clients
+After=wg-quick@wg0.service network-online.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --no-daemon --conf-file=/etc/conan-wg-dns.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect WireGuard traffic every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=wg-traffic-collect.service
+
+[Install]
+WantedBy=timers.target
