@@ -1,0 +1,559 @@
+<#
+Stage C P1C -- protected persistent sandbox + exclusive Windows lock.
+PlanOnly delegates to P1 read-only. Mock operations touch ONLY user ACL-protected
+%LOCALAPPDATA%\GcpWGStageC\P1CMock\p1c-fixture-* directories.
+NativeApply/NativeRollback are HARD DISABLED in this source version.
+No WireGuard, WinINET, xray, NRPT or Windows route changes are allowed.
+#>
+[CmdletBinding()]
+param(
+ [ValidateSet('PlanOnly','MockPlan','MockApply','MockRollback','MockHoldLock',
+              'MockTimeoutRecover','NativeApply','NativeRollback')]
+ [string]$Mode='PlanOnly',
+ [string]$MockRoot='',
+ [string]$RunId='P1B-SIM-001',
+ [ValidateRange(0,10000)][int]$FailBeforeRoute=0,
+ [ValidateRange(0,10000)][int]$CrashAfterRoute=0,
+ [ValidateRange(0,10000)][int]$CollideAtRoute=0,
+ [ValidateRange(0,10000)][int]$NrptDriftAtRoute=0,
+ [ValidateRange(0,10000)][int]$ProxyDriftAtRoute=0,
+ [ValidateRange(0,10000)][int]$GatewayDriftAtRoute=0,
+ [ValidateRange(0,10000)][int]$TimeoutAtRoute=0,
+ [ValidateRange(0,10000)][int]$HardCrashAfterRoute=0,
+ [ValidateRange(1,15)][int]$HoldSeconds=5,
+ [ValidateRange(1,15)][int]$DelaySeconds=2
+)
+$ErrorActionPreference='Stop'
+$Script:NativeWriteGate=$false
+$Script:Schema='stage-c-p1c-route-v1'
+function Emit([string]$Key,$Value){Write-Output ($Key+'='+[string]$Value)}
+if($Mode -like 'Native*'){
+ Emit 'NATIVE_GATE' 'HARD_DISABLED_REVIEW_REQUIRED'
+ Emit 'SYSTEM_MUTATIONS_PERFORMED' 'False'
+ exit 40
+}
+if($Mode -eq 'PlanOnly'){
+ $p=Join-Path $PSScriptRoot 'stage-c-p1-planonly-20261024.ps1'
+ & 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File $p
+ exit $LASTEXITCODE
+}
+# All mock files must reside in the protected per-user LOCALAPPDATA sandbox.
+if(-not $MockRoot -or $MockRoot -match '[\r\n]'){
+ Emit 'MOCK_RESULT' 'BLOCKED_NO_MOCKROOT';exit 41
+}
+if($RunId -notmatch '^[A-Za-z0-9_-]{3,64}$'){
+ Emit 'MOCK_RESULT' 'BLOCKED_BAD_RUN_ID';exit 41
+}
+$full=[System.IO.Path]::GetFullPath($MockRoot).TrimEnd('\')
+$base=[System.IO.Path]::GetFullPath(
+ (Join-Path $env:LOCALAPPDATA 'GcpWGStageC\P1CMock')
+).TrimEnd('\')
+if(-not $full.StartsWith($base+'\p1c-fixture-',[StringComparison]::OrdinalIgnoreCase) -or
+    -not [string]::Equals((Split-Path -Parent $full),$base,[StringComparison]::OrdinalIgnoreCase)){
+ Emit 'MOCK_RESULT' 'BLOCKED_OUTSIDE_LOCALAPPDATA_SANDBOX';exit 41
+}
+if(-not (Test-Path -LiteralPath $full -PathType Container) -or
+   -not (Test-Path -LiteralPath $base -PathType Container)){
+ Emit 'MOCK_RESULT' 'BLOCKED_PERSISTENT_FIXTURE_MISSING';exit 41
+}
+foreach($check in @($base,$full)){
+ $item=Get-Item -LiteralPath $check -Force
+ if(($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){
+  Emit 'MOCK_RESULT' 'BLOCKED_REPARSE_POINT_FIXTURE';exit 41
+ }
+ $acl=Get-Acl -LiteralPath $check
+ if(-not $acl.AreAccessRulesProtected){
+  Emit 'MOCK_RESULT' 'BLOCKED_ACL_INHERITANCE_NOT_PROTECTED';exit 41
+ }
+ $allowedSids=@(
+  [Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+  'S-1-5-18',  # SYSTEM
+  'S-1-5-32-544'  # built-in Administrators
+ )
+ foreach($ace in $acl.Access){
+  if($ace.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow){continue}
+  try{
+   $sid=$ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+  }catch{
+   Emit 'MOCK_RESULT' 'BLOCKED_UNRESOLVED_ACL_IDENTITY';exit 41
+  }
+  if($allowedSids -notcontains $sid){
+   Emit 'MOCK_RESULT' 'BLOCKED_BROAD_ACL_PERMISSION';exit 41
+  }
+ }
+}
+$Script:DelayNeeded=($Mode -eq 'MockTimeoutRecover')
+if($Script:DelayNeeded){Start-Sleep -Seconds $DelaySeconds}
+$lockPath=Join-Path $full 'p1c-fixture-global-writer.lock'
+if(Test-Path -LiteralPath $lockPath){
+ $info=Get-Item -LiteralPath $lockPath -Force
+ if(($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){
+  Emit 'MOCK_RESULT' 'BLOCKED_REPARSE_POINT_LOCK';exit 41
+ }
+}
+try {
+ $Script:LockStream=[System.IO.File]::Open($lockPath,
+  [System.IO.FileMode]::OpenOrCreate,[System.IO.FileAccess]::ReadWrite,
+  [System.IO.FileShare]::None)
+} catch [System.IO.IOException] {
+ Emit 'MOCK_RESULT' 'LOCK_BUSY_EXCLUSIVE_WRITER';exit 45
+}
+if($Mode -eq 'MockHoldLock'){
+ Emit 'MOCK_RESULT' 'LOCK_HELD'
+ Emit 'LOCK_PID' $PID
+ Start-Sleep -Seconds $HoldSeconds
+ Emit 'MOCK_RESULT' 'LOCK_RELEASED_AT_PROCESS_EXIT'
+ exit 0
+}
+$worldPath=Join-Path $full 'mockworld.json'
+$prefixPath=Join-Path $full 'prefixes.txt'
+$journalPath=Join-Path $full ("journal-"+$RunId+".json")
+$planPath=Join-Path $full ("plan-"+$RunId+".json")
+$Script:AuditPath=Join-Path $full ("audit-"+$RunId+".ndjson")
+$Script:AuditSequence=0
+$Script:AuditPreviousHash='GENESIS'
+if(-not (Test-Path -LiteralPath $worldPath -PathType Leaf)){
+ Emit 'MOCK_RESULT' 'BLOCKED_WORLD_MISSING';exit 41
+}
+foreach($safeFile in @($worldPath,$prefixPath,$journalPath,$planPath,$Script:AuditPath)){
+ if(Test-Path -LiteralPath $safeFile){
+  $info=Get-Item -LiteralPath $safeFile -Force
+  if(($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){
+   Emit 'MOCK_RESULT' 'BLOCKED_REPARSE_POINT_DATA_FILE';exit 41
+  }
+ }
+}
+function ReadJson([string]$Path){
+ $text=Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+ return ($text | ConvertFrom-Json -ErrorAction Stop)
+}
+function SaveJsonAtomic([string]$Path,$Object){
+ $tempPath=$Path+".stagec-$PID.tmp"
+ $previous=$Path+".stagec-$PID.previous.tmp"
+ $text=ConvertTo-Json -InputObject $Object -Depth 15
+ [System.IO.File]::WriteAllText($tempPath,$text,[System.Text.UTF8Encoding]::new($false))
+ try {
+  if(Test-Path -LiteralPath $Path -PathType Leaf){
+   # Win32 ReplaceFile requires a real backup path on this installation.
+   [System.IO.File]::Replace($tempPath,$Path,$previous,$true)
+  }else{[System.IO.File]::Move($tempPath,$Path)}
+ }finally{
+  if(Test-Path -LiteralPath $tempPath){Remove-Item -LiteralPath $tempPath -Force}
+  if(Test-Path -LiteralPath $previous){Remove-Item -LiteralPath $previous -Force}
+ }
+ Append-Audit 'FILE_COMMITTED' $Path
+}
+function HashText([string]$Value){
+ $h=[System.Security.Cryptography.SHA256]::Create()
+ try {
+  $bytes=[System.Text.Encoding]::UTF8.GetBytes($Value)
+  return ([BitConverter]::ToString($h.ComputeHash($bytes))).Replace('-','')
+ }finally{$h.Dispose()}
+}
+
+# Every committed mock file update is recorded in an append-only SHA256 chain.
+# This catches accidental/torn/casual corruption, not malicious replacement
+# by a same-account adversary who can recompute the entire chain.
+function Audit-EventHash($Event) {
+ return HashText (('{0}|{1}|{2}|{3}|{4}|{5}' -f
+   $Event.sequence,$Event.prev,$Event.kind,$Event.file,
+   $Event.fileSha256,$Event.runId))
+}
+function Append-Audit([string]$Kind,[string]$Path) {
+ $name=[System.IO.Path]::GetFileName($Path)
+ if(-not (Test-Path -LiteralPath $Path -PathType Leaf)){
+  throw 'AUDIT_OBJECT_MISSING'
+ }
+ $sha=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+ $event=[pscustomobject][ordered]@{
+  sequence=($Script:AuditSequence+1)
+  prev=$Script:AuditPreviousHash
+  kind=$Kind
+  file=$name
+  fileSha256=$sha
+  runId=$RunId
+  hash=''
+ }
+ $event.hash=Audit-EventHash $event
+ $json=ConvertTo-Json -InputObject $event -Compress -Depth 6
+ $bytes=[System.Text.Encoding]::UTF8.GetBytes($json+[char]10)
+ $stream=New-Object System.IO.FileStream(
+  $Script:AuditPath,[System.IO.FileMode]::Append,
+  [System.IO.FileAccess]::Write,[System.IO.FileShare]::Read)
+ try {
+  $stream.Write($bytes,0,$bytes.Length)
+  $stream.Flush($true)
+ }finally{$stream.Dispose()}
+ $Script:AuditSequence=$event.sequence
+ $Script:AuditPreviousHash=$event.hash
+}
+function Verify-Audit {
+ $Script:AuditSequence=0
+ $Script:AuditPreviousHash='GENESIS'
+ if(-not (Test-Path -LiteralPath $Script:AuditPath -PathType Leaf)){
+  if((Test-Path -LiteralPath $planPath) -or
+     (Test-Path -LiteralPath $journalPath)){
+   throw 'AUDIT_MISSING_WITH_PRIOR_STATE'
+  }
+  return
+ }
+ $lines=[System.IO.File]::ReadAllLines($Script:AuditPath)
+ if($lines.Count -eq 0){throw 'AUDIT_EMPTY'}
+ $last=[System.Collections.Generic.Dictionary[string,string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
+ foreach($line in $lines){
+  if(-not $line){throw 'AUDIT_BLANK_OR_TRUNCATED_LINE'}
+  try{$e=$line | ConvertFrom-Json -ErrorAction Stop}
+  catch{throw 'AUDIT_JSON_INVALID'}
+  if($e.runId -ne $RunId -or
+     [int]$e.sequence -ne ($Script:AuditSequence+1) -or
+     $e.prev -ne $Script:AuditPreviousHash -or
+     $e.hash -ne (Audit-EventHash $e)){
+    throw 'AUDIT_SHA256_CHAIN_MISMATCH'
+  }
+  $last[[string]$e.file]=[string]$e.fileSha256
+  $Script:AuditSequence=[int]$e.sequence
+  $Script:AuditPreviousHash=[string]$e.hash
+ }
+ foreach($name in $last.Keys){
+  if($name -notmatch '^(mockworld\.json|prefixes\.txt|plan-[A-Za-z0-9_-]+\.json|journal-[A-Za-z0-9_-]+\.json)$'){
+   throw 'AUDIT_UNEXPECTED_FILENAME'
+  }
+  $path=Join-Path $full $name
+  if(-not (Test-Path -LiteralPath $path -PathType Leaf)){
+   throw 'AUDIT_COMMITTED_FILE_MISSING'
+  }
+  if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToUpperInvariant() -ne $last[$name]){
+   throw 'AUDIT_COMMITTED_FILE_DIGEST_MISMATCH'
+  }
+ }
+}
+
+function RouteKey($Route){
+ return ('{0}|{1}|{2}|{3}|{4}' -f $Route.prefix,$Route.ifIndex,$Route.nextHop,$Route.metric,$Route.store)
+}
+function WorldHash($World){
+ $routeKeys=@(@($World.routes)|ForEach-Object{RouteKey $_}|Sort-Object)
+ $nrptKeys=@(@($World.nrpt)|ForEach-Object{
+   '{0}|{1}|{2}' -f $_.id,$_.server,((@($_.namespaces)|Sort-Object) -join ',')
+ }|Sort-Object)
+ $part=@(
+  ('physical='+$World.physicalIndex+'|'+$World.gateway)
+  ('proxy='+$World.proxyEnabled+'|'+$World.proxyServer)
+  ('wg='+$World.wgActive)
+  ('routes='+($routeKeys -join ';'))
+  ('nrpt='+($nrptKeys -join ';'))
+ ) -join ([char]10)
+ return HashText $part
+}
+function PrefixRoutes($World,[string]$Prefix){
+ return @(@($World.routes)|Where-Object{$_.prefix -eq $Prefix})
+}
+function ExactRoutes($World,$Route){
+ $key=RouteKey $Route
+ return @(@($World.routes)|Where-Object{(RouteKey $_) -ceq $key})
+}
+function ValidatePrefix([string]$Prefix){
+ if($Prefix -notmatch '^(\d{1,3}\.){3}\d{1,3}/(\d|[12]\d|3[0-2])$'){
+   throw 'INVALID_PREFIX_FORMAT'
+ }
+ $parts=$Prefix.Split('/')
+ $raw=[System.Net.IPAddress]::Parse($parts[0]).GetAddressBytes()
+ if($raw.Length -ne 4){throw 'NOT_IPV4'}
+ [uint64]$value=([uint64]$raw[0] -shl 24) -bor ([uint64]$raw[1] -shl 16) -bor ([uint64]$raw[2] -shl 8) -bor [uint64]$raw[3]
+ [uint64]$size=[uint64][Math]::Pow(2,32-[int]$parts[1])
+ if(($value % $size) -ne 0){throw 'UNALIGNED_PREFIX'}
+}
+function PrefixRange([string]$Prefix){
+ ValidatePrefix $Prefix
+ $parts=$Prefix.Split('/')
+ $bytes=[System.Net.IPAddress]::Parse($parts[0]).GetAddressBytes()
+ [uint64]$start=([uint64]$bytes[0] -shl 24) -bor ([uint64]$bytes[1] -shl 16) -bor ([uint64]$bytes[2] -shl 8) -bor [uint64]$bytes[3]
+ [uint64]$size=[uint64][Math]::Pow(2,32-[int]$parts[1])
+ return [pscustomobject]@{Start=$start;End=($start+$size-1)}
+}
+function ValidateWorld($World,[string[]]$Prefixes){
+ foreach($prop in @('routes','nrpt','physicalIndex','gateway','proxyEnabled','proxyServer','wgActive')){
+  if(-not $World.PSObject.Properties[$prop]){throw ('WORLD_MISSING_'+$prop)}
+ }
+ if([bool]$World.wgActive){throw 'WG_ALREADY_ON'}
+ if([int]$World.proxyEnabled -ne 1 -or $World.proxyServer -ne '127.0.0.1:7897'){
+  throw 'PROXY_NOT_XRAY_BASELINE'
+ }
+ if([int]$World.physicalIndex -le 0 -or -not $World.gateway){
+  throw 'PHYSICAL_GATEWAY_INVALID'
+ }
+ foreach($rule in @($World.nrpt)){
+  if($rule.server -ne '223.5.5.5'){throw 'NRPT_RESOLVER_INVALID'}
+ }
+ if(@($World.nrpt).Count -eq 0){throw 'NRPT_MISSING'}
+ if($Prefixes.Count -lt 1 -or $Prefixes.Count -gt 5494){throw 'PREFIX_COUNT_OUT_OF_RANGE'}
+ $ranges=@($Prefixes|ForEach-Object{PrefixRange $_}|Sort-Object Start,End)
+ [int64]$previousEnd=-1
+ foreach($r in $ranges){
+  if([int64]$r.Start -le $previousEnd){throw 'OVERLAPPING_PREFIXES'}
+  $previousEnd=[int64]$r.End
+ }
+ $seen=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+ foreach($p in $Prefixes){
+  ValidatePrefix $p
+  if(-not $seen.Add($p)){throw 'DUPLICATE_PREFIX'}
+  $oldRoutes=@(PrefixRoutes $World $p)
+  if($oldRoutes.Count -gt 1){throw 'AMBIGUOUS_PREEXISTING_ROUTE'}
+  foreach($route in $oldRoutes){
+   if([int]$route.ifIndex -ne [int]$World.physicalIndex -or [string]$route.nextHop -ne [string]$World.gateway){
+    throw ('FOREIGN_ROUTE_COLLISION_'+$p)
+   }
+  }
+ }
+}
+# Future Windows native adapter, IMPOSSIBLE to call through today's CLI gate.
+# Native writes are untested and have no live authorization.
+function NativeAdd($Route){
+ if(-not $Script:NativeWriteGate){throw 'NATIVE_APPLY_HARD_DISABLED'}
+ New-NetRoute -AddressFamily IPv4 -DestinationPrefix $Route.prefix -InterfaceIndex $Route.ifIndex -NextHop $Route.nextHop -RouteMetric $Route.metric -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+}
+function NativeRemove($Route){
+ if(-not $Script:NativeWriteGate){throw 'NATIVE_ROLLBACK_HARD_DISABLED'}
+ $match=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix $Route.prefix -InterfaceIndex $Route.ifIndex -ErrorAction Stop|Where-Object{$_.NextHop -eq $Route.nextHop -and $_.RouteMetric -eq $Route.metric -and $_.PolicyStore -eq $Route.store})
+ if($match.Count -ne 1){throw 'NATIVE_ROUTE_OWNERSHIP_AMBIGUOUS'}
+ $match[0]|Remove-NetRoute -Confirm:$false -ErrorAction Stop
+}
+try {
+ Verify-Audit
+} catch {
+ Emit 'MOCK_RESULT' 'BLOCKED_AUDIT_INTEGRITY'
+ Emit 'AUDIT_ERROR' $_.Exception.Message
+ exit 46
+}
+if($Mode -eq 'MockTimeoutRecover'){
+ # This is an independent sandbox-only timer simulation, not a real watchdog.
+ Append-Audit 'MOCK_TIMEOUT_TRIGGERED' $journalPath
+ $Mode='MockRollback'
+}
+if($Mode -eq 'MockPlan'){
+ if(-not (Test-Path -LiteralPath $prefixPath -PathType Leaf)){Emit 'MOCK_RESULT' 'BLOCKED_NO_PREFIX_INPUT';exit 42}
+ if((Test-Path -LiteralPath $planPath -PathType Leaf) -or
+    (Test-Path -LiteralPath $journalPath -PathType Leaf)){
+    Emit 'MOCK_RESULT' 'BLOCKED_PREVIOUS_PLAN_OR_JOURNAL';exit 42
+ }
+ $world=ReadJson $worldPath
+ $prefixes=@(Get-Content -LiteralPath $prefixPath|ForEach-Object{$_.Trim()}|Where-Object{$_})
+ try{ValidateWorld $world $prefixes}catch{
+  Emit 'MOCK_RESULT' ('BLOCKED_'+$_.Exception.Message);exit 42
+ }
+ $toAdd=0;$borrowed=0
+ foreach($prefix in $prefixes){
+  if(@(PrefixRoutes $world $prefix).Count){$borrowed++}else{$toAdd++}
+ }
+ $plan=[pscustomobject][ordered]@{
+  schema=$Script:Schema;runId=$RunId;worldHash=(WorldHash $world)
+  prefixesHash=(HashText ($prefixes -join ([char]10)))
+  targetCount=$prefixes.Count;addCount=$toAdd;borrowedCount=$borrowed
+  type='MOCK_ONLY_NOT_LIVE'
+ }
+ Append-Audit 'PLAN_BASELINE_WORLD' $worldPath
+ Append-Audit 'PLAN_DESIRED_PREFIXES' $prefixPath
+ SaveJsonAtomic $planPath $plan
+ Emit 'MOCK_RESULT' 'PLAN_SAVED_PERSISTENT_SANDBOX'
+ Emit 'ROUTES_TO_ADD' $toAdd
+ Emit 'BORROWED_TO_PRESERVE' $borrowed
+ Emit 'SYSTEM_MUTATIONS_PERFORMED' 'False'
+ exit 0
+}
+if($Mode -eq 'MockApply'){
+ if(-not (Test-Path -LiteralPath $prefixPath -PathType Leaf)){Emit 'MOCK_RESULT' 'BLOCKED_NO_PREFIX_INPUT';exit 42}
+ if(-not (Test-Path -LiteralPath $planPath -PathType Leaf)){
+  Emit 'MOCK_RESULT' 'BLOCKED_MOCK_PLAN_REQUIRED';exit 42
+ }
+ if(Test-Path -LiteralPath $journalPath -PathType Leaf){Emit 'MOCK_RESULT' 'BLOCKED_EXISTING_JOURNAL';exit 42}
+ $world=ReadJson $worldPath
+ $prefixes=@(Get-Content -LiteralPath $prefixPath|ForEach-Object{$_.Trim()}|Where-Object{$_})
+ $plan=ReadJson $planPath
+ $snapshotHash=WorldHash $world
+ $prefixesHash=HashText ($prefixes -join ([char]10))
+ if($plan.schema -ne $Script:Schema -or $plan.runId -ne $RunId -or
+    $plan.worldHash -ne $snapshotHash -or $plan.prefixesHash -ne $prefixesHash){
+  Emit 'MOCK_RESULT' 'BLOCKED_STALE_PLAN_OR_PREFIXES'
+  exit 42
+ }
+ try{ValidateWorld $world $prefixes}catch{
+  Emit 'MOCK_RESULT' ('BLOCKED_'+$_.Exception.Message);exit 42
+ }
+ $before=$snapshotHash
+ $journal=[pscustomobject][ordered]@{
+  schema=$Script:Schema;runId=$RunId;status='APPLYING'
+  beforeHash=$before;beforeGateway=[string]$world.gateway
+  beforeIndex=[int]$world.physicalIndex
+  beforeRoutes=@(@($world.routes)|ForEach-Object{RouteKey $_})
+  entries=@();events=@('SNAPSHOT_PERSISTED')
+ }
+ SaveJsonAtomic $journalPath $journal
+ $index=0
+ try{
+  foreach($prefix in $prefixes){
+   $index++
+   if([string]$world.gateway -ne $journal.beforeGateway -or [int]$world.physicalIndex -ne $journal.beforeIndex){
+    throw 'PHYSICAL_GATEWAY_DRIFT'
+   }
+   $existing=@(PrefixRoutes $world $prefix)
+   if($existing.Count){
+    $journal.events=@($journal.events)+@('BORROWED_'+$prefix)
+    SaveJsonAtomic $journalPath $journal
+    continue
+   }
+   $route=[pscustomobject][ordered]@{
+     prefix=$prefix;ifIndex=[int]$world.physicalIndex
+     nextHop=[string]$world.gateway;metric=5;store='ActiveStore'
+   }
+   # Two-phase journal: record intent BEFORE the mock write.
+   $entry=[pscustomobject][ordered]@{
+      prefix=$route.prefix;ifIndex=$route.ifIndex;nextHop=$route.nextHop
+      metric=$route.metric;store=$route.store;state='INTENT'
+   }
+   $journal.entries=@($journal.entries)+@($entry)
+   SaveJsonAtomic $journalPath $journal
+   if($FailBeforeRoute -eq $index){throw ('FAULT_BEFORE_ROUTE_'+$index)}
+   $world.routes=@($world.routes)+@($route)
+   SaveJsonAtomic $worldPath $world
+   if($HardCrashAfterRoute -eq $index){
+    Emit 'MOCK_RESULT' ('HARD_PROCESS_EXIT_AFTER_WRITE_'+$index)
+    [System.Environment]::Exit(77)
+   }
+   if($CrashAfterRoute -eq $index){throw ('CRASH_AFTER_WRITE_'+$index)}
+   if($CollideAtRoute -eq $index){
+     $alien=[pscustomobject][ordered]@{
+       prefix=$prefix;ifIndex=99;nextHop='192.0.2.99';metric=1;store='ActiveStore'
+     }
+     $world.routes=@($world.routes)+@($alien)
+     SaveJsonAtomic $worldPath $world
+     throw 'THIRD_PARTY_ROUTE_INSERTED'
+   }
+   if($NrptDriftAtRoute -eq $index){
+     $world.nrpt[0].server='8.8.8.8'
+     SaveJsonAtomic $worldPath $world
+     throw 'NRPT_DRIFT'
+   }
+   if($GatewayDriftAtRoute -eq $index){
+     $world.gateway='198.51.100.1'
+     SaveJsonAtomic $worldPath $world
+     throw 'GATEWAY_DRIFT'
+   }
+   if($ProxyDriftAtRoute -eq $index){
+     $world.proxyServer='127.0.0.1:19999'
+     SaveJsonAtomic $worldPath $world
+     throw 'PROXY_DRIFT'
+   }
+   if($TimeoutAtRoute -eq $index){
+     $journal.events=@($journal.events)+@('MOCK_TIMEOUT_FIRED')
+     SaveJsonAtomic $journalPath $journal
+     throw 'MOCK_TIMER_TIMEOUT'
+   }
+   if(@(ExactRoutes $world $route).Count -ne 1){throw 'POSTWRITE_IDENTITY_NOT_UNIQUE'}
+   $journal.entries[-1].state='VERIFIED'
+   $journal.events=@($journal.events)+@('ADD_VERIFIED_'+$index)
+   SaveJsonAtomic $journalPath $journal
+  }
+  $journal.status='MOCK_APPLY_COMPLETE_AWAIT_ROLLBACK'
+  SaveJsonAtomic $journalPath $journal
+  Emit 'MOCK_RESULT' 'APPLY_SIMULATION_PASS'
+  Emit 'JOURNAL_ENTRY_COUNT' @($journal.entries).Count
+  Emit 'SYSTEM_MUTATIONS_PERFORMED' 'False'
+  exit 0
+ }catch{
+  $journal.status='MOCK_APPLY_FAILED_AWAIT_ROLLBACK'
+  $journal.events=@($journal.events)+@('FAULT_'+$_.Exception.Message)
+  SaveJsonAtomic $journalPath $journal
+  Emit 'MOCK_RESULT' 'APPLY_FAILED_ROLLBACK_REQUIRED'
+  Emit 'FAILURE_CAUSE' $_.Exception.Message
+  Emit 'JOURNAL_ENTRY_COUNT' @($journal.entries).Count
+  Emit 'SYSTEM_MUTATIONS_PERFORMED' 'False'
+  exit 3
+ }
+}
+if($Mode -eq 'MockRollback'){
+ if(-not (Test-Path -LiteralPath $journalPath -PathType Leaf)){Emit 'MOCK_RESULT' 'BLOCKED_JOURNAL_MISSING';exit 43}
+ $world=ReadJson $worldPath
+ $journal=ReadJson $journalPath
+ if($journal.schema -ne $Script:Schema -or $journal.runId -ne $RunId){
+  Emit 'MOCK_RESULT' 'BLOCKED_RUNID_SCHEMA_MISMATCH';exit 43
+ }
+ if(-not (Test-Path -LiteralPath $planPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $prefixPath -PathType Leaf)){
+  Emit 'MOCK_RESULT' 'BLOCKED_MISSING_PLAN_EVIDENCE';exit 43
+ }
+ $plan=ReadJson $planPath
+ $originalPrefixes=@(Get-Content -LiteralPath $prefixPath | ForEach-Object {$_.Trim()} | Where-Object {$_})
+ $expectedPrefixHash=HashText ($originalPrefixes -join ([char]10))
+ if($plan.schema -ne $Script:Schema -or $plan.runId -ne $RunId -or
+    $plan.worldHash -ne $journal.beforeHash -or
+    $plan.prefixesHash -ne $expectedPrefixHash){
+  Emit 'MOCK_RESULT' 'BLOCKED_PLAN_JOURNAL_MISMATCH';exit 43
+ }
+ $approved=[System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+ foreach($prefix in $originalPrefixes){[void]$approved.Add($prefix)}
+ foreach($entry in @($journal.entries)){
+  if(-not $approved.Contains([string]$entry.prefix) -or
+     [int]$entry.ifIndex -ne [int]$journal.beforeIndex -or
+     [string]$entry.nextHop -ne [string]$journal.beforeGateway){
+   Emit 'MOCK_RESULT' 'BLOCKED_JOURNAL_ROUTE_IDENTITY';exit 43
+  }
+ }
+ if($journal.status -eq 'MOCK_ROLLBACK_VERIFIED' -and (WorldHash $world) -eq $journal.beforeHash){
+  Emit 'MOCK_RESULT' 'ROLLBACK_IDEMPOTENT'
+  Emit 'BASELINE_RESTORED' 'True'
+  exit 0
+ }
+ $errors=[System.Collections.Generic.List[string]]::new()
+ $entries=@($journal.entries)
+ for($i=$entries.Count-1;$i -ge 0;$i--){
+  $entry=$entries[$i]
+  if($entry.state -eq 'REMOVED' -or $entry.state -eq 'NOT_PRESENT'){continue}
+  $same=@(PrefixRoutes $world $entry.prefix)
+  $exact=@(ExactRoutes $world $entry)
+  if($same.Count -eq 0){
+   $entry.state='NOT_PRESENT'
+   SaveJsonAtomic $journalPath $journal
+   continue
+  }
+  if($same.Count -ne 1 -or $exact.Count -ne 1){
+   $errors.Add('AMBIGUOUS_OWNERSHIP_'+$entry.prefix)
+   continue
+  }
+  if(@($journal.beforeRoutes) -contains (RouteKey $entry)){
+   $errors.Add('PREEXISTING_ROUTE_MUST_NOT_DELETE_'+$entry.prefix)
+   continue
+  }
+  $removeOnce=$false
+  $kept=[System.Collections.Generic.List[object]]::new()
+  foreach($route in @($world.routes)){
+   if(-not $removeOnce -and (RouteKey $route) -ceq (RouteKey $entry)){
+     $removeOnce=$true
+   }else{$kept.Add($route)}
+  }
+  $world.routes=@($kept)
+  SaveJsonAtomic $worldPath $world
+  $entry.state='REMOVED'
+  $journal.events=@($journal.events)+@('REMOVED_'+$entry.prefix)
+  SaveJsonAtomic $journalPath $journal
+ }
+ $sameHash=(WorldHash $world) -eq $journal.beforeHash
+ if(-not $sameHash){$errors.Add('ORIGINAL_BASELINE_NOT_RESTORED')}
+ if($errors.Count){
+   $journal.status='MOCK_ROLLBACK_INCOMPLETE'
+   SaveJsonAtomic $journalPath $journal
+   Emit 'MOCK_RESULT' 'ROLLBACK_INCOMPLETE'
+   Emit 'BASELINE_RESTORED' 'False'
+   Emit 'PROBLEM_COUNT' $errors.Count
+   foreach($e in $errors){Emit 'ROLLBACK_PROBLEM' $e}
+   Emit 'SYSTEM_MUTATIONS_PERFORMED' 'False'
+   exit 4
+ }
+ $journal.status='MOCK_ROLLBACK_VERIFIED'
+ $journal.events=@($journal.events)+@('VERIFY_HASH_MATCH')
+ SaveJsonAtomic $journalPath $journal
+ Emit 'MOCK_RESULT' 'ROLLBACK_SIMULATION_PASS'
+ Emit 'BASELINE_RESTORED' 'True'
+ Emit 'SYSTEM_MUTATIONS_PERFORMED' 'False'
+ exit 0
+}
