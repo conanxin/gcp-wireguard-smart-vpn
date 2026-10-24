@@ -21,7 +21,7 @@ $script:Exe='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 $script:P1E=Join-Path $PSScriptRoot 'stage-c-p1e-testnet-canary-20261024.ps1'
 $script:P1ESha256='36427E5BE890785AE37D4A81953CD4FFF7789153B8BF13C6CC6B4264E4ADA738'
 $script:Worker=Join-Path $PSScriptRoot 'stage-c-p1f-independent-watchdog-20261024.ps1'
-$script:WorkerSha256='1A7E0BD3D61F1ECDBB53638D58AB11C7F317BBEFBF6597C70020370E7058A6F9'
+$script:WorkerSha256='5D5EBB33EC466EDE17110911895DA953D62FAEBF5C850303DA51299C4002A9AD'
 $script:Root=Join-Path $env:LOCALAPPDATA 'GcpWGStageC\P1ECanary'
 $script:WriterLock=$null
 
@@ -85,7 +85,8 @@ function RouteIdentical($Route,$Manifest){
   [int]$Route.InterfaceIndex -eq [int]$Manifest.ifIndex -and
   [string]$Route.NextHop -eq [string]$Manifest.gateway -and
   [int]$Route.RouteMetric -eq $script:Metric -and
-  [string]$Route.PolicyStore -eq 'ActiveStore')
+  ([string]$Route.PolicyStore -eq 'ActiveStore' -or
+   [string]$Route.Store -eq 'ActiveStore'))
 }
 function ReadOnlyCheck {
  VerifyP1E
@@ -162,6 +163,16 @@ function ReadOnlyStatus {
   if($ok){Emit 'P1F_RESULT' 'STRANDED_NATIVE_ROUTE_WATCHDOG_CLEANUP_PASS'}
   else{Emit 'P1F_RESULT' 'ROUTE_CLEAN_BUT_NETWORK_BASELINE_FAILED'}
   return
+ }
+ if($m.status -eq 'ROLLBACK_VERIFIED' -and $active.Count -eq 0 -and
+    $persistent.Count -eq 0 -and
+    (Test-Path -LiteralPath (WPath $id)) -and
+    -not $receipt){
+   $out=JsonRead (WPath $id)
+   if($out.outcome -eq 'IDEMPOTENT_EMPTY_ROUTE_AT_DEADLINE'){
+     Emit 'P1F_RESULT' 'ABORTED_BEFORE_STRANDED_ROUTE_TEST_RECOVERED'
+     return
+   }
  }
  if($active.Count -eq 1 -and $m.status -in @('INTENT','ACTIVE')){
   if(RouteIdentical $active[0] $m){Emit 'P1F_RESULT' 'STRANDED_NATIVE_ROUTE_AWAITING_WATCHDOG'}

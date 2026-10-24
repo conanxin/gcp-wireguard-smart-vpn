@@ -64,7 +64,8 @@ function IdentityMatches($Row,$Record){
   [int]$Row.InterfaceIndex -eq [int]$Record.ifIndex -and
   [string]$Row.NextHop -eq [string]$Record.gateway -and
   [int]$Row.RouteMetric -eq $script:Metric -and
-  [string]$Row.PolicyStore -eq 'ActiveStore')
+  ([string]$Row.PolicyStore -eq 'ActiveStore' -or
+   [string]$Row.Store -eq 'ActiveStore'))
 }
 function BaselineAfter {
  $out=@(& $script:Exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:P1E -Mode CheckOnly 2>&1)

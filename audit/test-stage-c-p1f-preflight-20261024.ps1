@@ -38,6 +38,36 @@ Assert ($cont.Contains("198.51.100.77/32") -and $work.Contains("198.51.100.77/32
 Assert ((Get-FileHash -LiteralPath $p1e -Algorithm SHA256).Hash -eq '36427E5BE890785AE37D4A81953CD4FFF7789153B8BF13C6CC6B4264E4ADA738') 'LEGACY_WATCHDOG_SOURCE_PINNED'
 $workerHash=(Get-FileHash -LiteralPath $worker -Algorithm SHA256).Hash
 Assert ($cont.Contains($workerHash)) 'WORKER_SHA_PINNED_IN_CONTROLLER'
+# Regression for P1F failure: real Windows CIM route may have Store=ActiveStore
+# with NO PolicyStore property. The original validator rejected such routes.
+$sample=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Where-Object {$_.NextHop -ne '0.0.0.0'} | Select-Object -First 1)
+Assert ($sample.Count -eq 1) 'REAL_CIM_ROUTE_SAMPLE_EXISTS'
+if($sample.Count -eq 1){
+ $route=$sample[0]
+ Assert ((-not $route.PSObject.Properties['PolicyStore']) -and
+         ($route.PSObject.Properties['Store']) -and
+         [string]$route.Store -eq 'ActiveStore') 'REAL_CIM_STORE_ONLY_SHAPE'
+ foreach($testCase in @(@($controller,'RouteIdentical'),@($worker,'IdentityMatches'))){
+  $src=$testCase[0];$fn=$testCase[1]
+  $tokens=$null;$errors=$null
+  $ast=[System.Management.Automation.Language.Parser]::ParseFile($src,[ref]$tokens,[ref]$errors)
+  $defs=@($ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst]},$true) | Where-Object {$_.Name -eq $fn})
+  Assert ($defs.Count -eq 1) ('EXACT_FUNC_'+$fn)
+  if($defs.Count -eq 1){ . ([scriptblock]::Create($defs[0].Extent.Text)) }
+ }
+ $script:Prefix=$route.DestinationPrefix
+ $script:Target=$route.DestinationPrefix
+ $script:Metric=[int]$route.RouteMetric
+ $record=[pscustomobject]@{ifIndex=[int]$route.InterfaceIndex;gateway=[string]$route.NextHop}
+ Assert ([bool](RouteIdentical $route $record)) 'CONTROLLER_CIM_ROUTE_IDENTITY_TRUE'
+ Assert ([bool](IdentityMatches $route $record)) 'WORKER_CIM_ROUTE_IDENTITY_TRUE'
+ $wrong=[pscustomobject]@{ifIndex=([int]$route.InterfaceIndex+1000);gateway=[string]$route.NextHop}
+ Assert (-not (RouteIdentical $route $wrong)) 'CONTROLLER_WRONG_INTERFACE_REJECTED'
+ Assert (-not (IdentityMatches $route $wrong)) 'WORKER_WRONG_INTERFACE_REJECTED'
+ $persistent=[pscustomobject]@{DestinationPrefix=$route.DestinationPrefix;InterfaceIndex=$route.InterfaceIndex;NextHop=$route.NextHop;RouteMetric=$route.RouteMetric;Store='PersistentStore'}
+ Assert (-not (RouteIdentical $persistent $record)) 'CONTROLLER_PERSISTENT_STORE_REJECTED'
+ Assert (-not (IdentityMatches $persistent $record)) 'WORKER_PERSISTENT_STORE_REJECTED'
+}
 Assert ((@($cont -split [char]10 | Where-Object {$_ -match '^\s*New-NetRoute @args'}).Count -eq 1) -and
         (-not $cont.Contains('Remove-NetRoute')) -and
         (-not $work.Contains('Remove-NetRoute'))) 'ONE_NATIVE_ADD_ONLY_ROLLBACK_DELEGATED_TO_P1E'

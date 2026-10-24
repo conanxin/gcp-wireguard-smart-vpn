@@ -140,3 +140,56 @@ or power loss. Manual recovery is therefore required.
 
 Keep all stacked GitHub pull requests DRAFT/unmerged until a separate
 SMART CN-route-specific stage has passed real route and recovery gates.
+
+
+## 2026-10-24 R1 real run aborted safely; verified root cause and R2 repair
+
+**Real local Admin experiment R1 was NOT a P1F PASS.** Console output:
+- CheckOnly PASS; independent 120-second worker successfully armed.
+- One fixed TEST-NET ActiveStore route was added, but the new P1F
+  controller returned NATIVE_POSTWRITE_ROUTE_IDENTITY_INVALID.
+- P1E emergency exact rollback was immediately invoked by the parent,
+  returning exit 0 and P1E_ROLLBACK=PASS. Run manifest ROLLBACK_VERIFIED.
+- P1F writer returned BLOCKED_OR_INCOMPLETE (exit 4), NOT 77, and
+  deliberately stranded route cleanup was not reached.
+- Independent Windows recheck confirmed TEST-NET ActiveStore=0 and
+  PersistentStore=0, WG service/adapter absent, half-default route count=0,
+  WLAN default route intact, xray process=1, system proxy enabled
+  127.0.0.1:7897, NRPT project count=25, xray HTTPS 204 / exit 0.
+- Worker later emitted IDEMPOTENT_EMPTY_ROUTE_AT_DEADLINE, with before=0,
+  after=0, native rollback exit=0 and baselineRestored=True. It did
+  NOT remove a stranded native route; process then terminated.
+
+**Exact root cause confirmed on the actual Windows Get-NetRoute CIM object:**
+- The returned object has a Store property whose value is ActiveStore.
+- It does NOT have a PolicyStore property.
+- The original P1F controller and P1F worker incorrectly required
+  Route.PolicyStore / Row.PolicyStore == ActiveStore.
+- The successfully verified P1E source had supported either PolicyStore
+  OR Store already, and that source remains unchanged.
+
+**R2 repair:** Both P1F predicates now accept PolicyStore=ActiveStore
+OR Store=ActiveStore, with no broadening to PersistentStore, mismatched
+interface index or gateway. The controller updated the hard-pinned
+independent worker SHA256. Read-only Status also explicitly classifies
+the prior recovered abort as ABORTED_BEFORE_STRANDED_ROUTE_TEST_RECOVERED.
+
+Windows PowerShell 5.1 *actual CIM route object* nonmutating regressions
+now check BOTH predicates for:
+- Positive match using real Store-only ActiveStore returned by Windows.
+- Negative mismatched interface index.
+- Negative PersistentStore route that must never be deleted.
+Existing safe preflight / negative test gates remain intact.
+**R2 nonmutating test result: 25/25 PASS, AST 0, exit 0**.
+
+R2 has NOT been rerun under local Admin to add a real native route;
+the stranded-watchdog branch remains NOT_TESTED until a separate
+user-supervised R2 real console result and independent post-audit.
+Never reinterpret R1's automatic emergency cleanup as P1F PASS.
+
+R2 controller and worker source hashes (after the tested repair):
+- controller SHA256: 8766502796F237348CEA735A3E850BB581EF97AB39893D82C9F0B6619A1784CC
+- worker SHA256: 5D5EBB33EC466EDE17110911895DA953D62FAEBF5C850303DA51299C4002A9AD
+
+**The original P1E emergency route rollback source remains pinned to
+36427E5BE890785AE37D4A81953CD4FFF7789153B8BF13C6CC6B4264E4ADA738.**
