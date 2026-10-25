@@ -1,0 +1,58 @@
+{
+  "_NOTICE": "P1M DOCUMENTATION-ONLY; NONFUNCTIONAL PLACEHOLDER KEYS; DO NOT DEPLOY; NEVER REPLACE PRODUCTION v2rayN CONFIG DIRECTLY",
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "tag": "GCP_WG_OUTBOUND_DRAFT",
+      "protocol": "wireguard",
+      "settings": {
+        "secretKey": "__SYNTHETIC_ONLY_OR_LOCAL_PRIVATE_KEY_REQUIRED__",
+        "address": [
+          "10.66.66.2"
+        ],
+        "peers": [
+          {
+            "endpoint": "192.0.2.1:443",
+            "publicKey": "__SYNTHETIC_ONLY_OR_VERIFIED_SERVER_PUBLIC_KEY_REQUIRED__",
+            "allowedIPs": [
+              "0.0.0.0/0"
+            ],
+            "keepAlive": 0
+          }
+        ],
+        "noKernelTun": true,
+        "mtu": 1420,
+        "remoteDNS": [
+          "10.66.66.1"
+        ]
+      }
+    },
+    {
+      "tag": "CN_DIRECT_DRAFT",
+      "protocol": "freedom"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "domain": [
+          "geosite:cn"
+        ],
+        "outboundTag": "CN_DIRECT_DRAFT"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "geoip:private",
+          "geoip:cn"
+        ],
+        "outboundTag": "CN_DIRECT_DRAFT"
+      }
+    ]
+  }
+}
